@@ -140,25 +140,3 @@ make build-exe   # Windows .exe
 ```
 
 The Windows `.exe` uses the same `.env` variables at runtime.
-
-## Turnstile Inspector Browser Extension
-
-If a website does not expose Turnstile values directly, use the included extension:
-
-- Path: `turnstile-inspector-extension/`
-- Purpose: capture `sitekey`, `action`, and `cdata` while you solve Turnstile manually.
-
-### Install (Chrome/Chromium)
-
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. Click **Load unpacked**
-4. Select the `turnstile-inspector-extension` folder
-
-### Use
-
-1. Open the target website (example: DataImpulse sign-in page).
-2. Keep the extension enabled in background.
-3. Solve Turnstile manually.
-4. Open the extension popup to view captured values.
-5. Click **Copy Latest JSON** to copy the latest `url/sitekey/action/cdata`.

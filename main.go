@@ -751,6 +751,68 @@ func clickTurnstileCheckbox(page playwright.Page) {
 	}
 }
 
+func readDOMValidationState(page playwright.Page) map[string]any {
+	result, err := page.Evaluate(`() => {
+		const widget = document.querySelector("#widget");
+		const input = document.querySelector("input[name='cf-turnstile-response']");
+		const iframe = document.querySelector("iframe[src*='challenges.cloudflare.com'], iframe[src*='challenges.fed.cloudflare.com']");
+		const iframeRect = iframe ? iframe.getBoundingClientRect() : null;
+		const iframeVisible = !!iframeRect && iframeRect.width > 0 && iframeRect.height > 0;
+
+		return {
+			widget: !!widget,
+			input: !!input,
+			turnstile: !!window.turnstile,
+			rendered: !!window.__turnstileRendered,
+			iframe: !!iframe,
+			iframeVisible: iframeVisible,
+			error: String(window.__turnstileError || "")
+		};
+	}`)
+	if err != nil {
+		return map[string]any{
+			"error": err.Error(),
+		}
+	}
+	if state, ok := result.(map[string]any); ok {
+		return state
+	}
+	return map[string]any{
+		"error": "invalid DOM validation response",
+	}
+}
+
+func validateTurnstileDOM(page playwright.Page) error {
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	var lastState map[string]any
+
+	for time.Now().Before(deadline) {
+		lastState = readDOMValidationState(page)
+
+		if errText, ok := lastState["error"].(string); ok && strings.TrimSpace(errText) != "" {
+			if !strings.Contains(strings.ToLower(errText), "unknown_error") {
+				return fmt.Errorf("%s", errText)
+			}
+		}
+
+		widget, _ := lastState["widget"].(bool)
+		input, _ := lastState["input"].(bool)
+		turnstile, _ := lastState["turnstile"].(bool)
+		rendered, _ := lastState["rendered"].(bool)
+		iframe, _ := lastState["iframe"].(bool)
+		iframeVisible, _ := lastState["iframeVisible"].(bool)
+
+		if widget && input && turnstile && rendered && iframe && iframeVisible {
+			return nil
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	stateJSON, _ := json.Marshal(lastState)
+	return fmt.Errorf("turnstile DOM invalid: %s", string(stateJSON))
+}
+
 func collectTaskCookies(page playwright.Page, taskURL string) []TaskCookie {
 	if page == nil || page.Context() == nil {
 		return nil
@@ -827,6 +889,11 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 	}
 	if err != nil {
 		setTaskFailed(task, fmt.Sprintf("overlay error: %v", err))
+		return false
+	}
+
+	if err := validateTurnstileDOM(page); err != nil {
+		setTaskFailed(task, fmt.Sprintf("dom validation error: %v", err))
 		return false
 	}
 
