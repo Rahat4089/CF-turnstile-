@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,18 +38,31 @@ type Config struct {
 }
 
 type SolveTask struct {
-	TaskID      string   `json:"task_id"`
-	URL         string   `json:"url"`
-	Sitekey     string   `json:"sitekey"`
-	Proxy       *string  `json:"proxy,omitempty"`
-	Action      *string  `json:"action,omitempty"`
-	Cdata       *string  `json:"cdata,omitempty"`
-	Status      string   `json:"status"`
-	Token       *string  `json:"token,omitempty"`
-	Error       *string  `json:"error,omitempty"`
-	Attempts    int      `json:"attempts"`
-	CreatedAt   float64  `json:"created_at"`
-	CompletedAt *float64 `json:"completed_at,omitempty"`
+	TaskID      string            `json:"task_id"`
+	URL         string            `json:"url"`
+	Sitekey     string            `json:"sitekey"`
+	Proxy       *string           `json:"proxy,omitempty"`
+	Action      *string           `json:"action,omitempty"`
+	Cdata       *string           `json:"cdata,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Cookies     []TaskCookie      `json:"cookies,omitempty"`
+	Status      string            `json:"status"`
+	Token       *string           `json:"token,omitempty"`
+	Error       *string           `json:"error,omitempty"`
+	Attempts    int               `json:"attempts"`
+	CreatedAt   float64           `json:"created_at"`
+	CompletedAt *float64          `json:"completed_at,omitempty"`
+}
+
+type TaskCookie struct {
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain"`
+	Path     string  `json:"path"`
+	Expires  float64 `json:"expires"`
+	HttpOnly bool    `json:"httpOnly"`
+	Secure   bool    `json:"secure"`
+	SameSite string  `json:"sameSite,omitempty"`
 }
 
 type CreateTaskRequest struct {
@@ -83,7 +98,10 @@ type GetTaskResultResponse struct {
 }
 
 type Solution struct {
-	Token string `json:"token"`
+	Token    string            `json:"token"`
+	Headers  map[string]string `json:"headers,omitempty"`
+	Hedeares map[string]string `json:"hedears,omitempty"`
+	Cookies  []TaskCookie      `json:"cookies,omitempty"`
 }
 
 type BrowserWorker struct {
@@ -201,6 +219,15 @@ func cloneTask(task *SolveTask) *SolveTask {
 	cloned.Cdata = cloneStringPtr(task.Cdata)
 	cloned.Token = cloneStringPtr(task.Token)
 	cloned.Error = cloneStringPtr(task.Error)
+	if task.Headers != nil {
+		cloned.Headers = make(map[string]string, len(task.Headers))
+		for key, value := range task.Headers {
+			cloned.Headers[key] = value
+		}
+	}
+	if task.Cookies != nil {
+		cloned.Cookies = append([]TaskCookie(nil), task.Cookies...)
+	}
 	if task.CompletedAt != nil {
 		completedAt := *task.CompletedAt
 		cloned.CompletedAt = &completedAt
@@ -559,13 +586,22 @@ func buildTurnstileSandboxHTML(sitekey string, action string, cdata string) stri
 </html>`, jsString(sitekey), actionConfig, cdataConfig)
 }
 
-func loadTurnstileInTab(page playwright.Page, task *SolveTask) error {
-	_, err := page.Goto(task.URL, playwright.PageGotoOptions{
+func loadTurnstileInTab(page playwright.Page, task *SolveTask) (map[string]string, error) {
+	resp, err := page.Goto(task.URL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(float64((CONFIG.TimeoutSeconds + 10) * 1000)),
 	})
 	if err != nil {
-		return fmt.Errorf("navigation error: %w", err)
+		return nil, fmt.Errorf("navigation error: %w", err)
+	}
+
+	headers := map[string]string{}
+	if resp != nil && resp.Request() != nil {
+		if allHeaders, allErr := resp.Request().AllHeaders(); allErr == nil && len(allHeaders) > 0 {
+			headers = allHeaders
+		} else {
+			headers = resp.Request().Headers()
+		}
 	}
 
 	action := ""
@@ -578,10 +614,14 @@ func loadTurnstileInTab(page playwright.Page, task *SolveTask) error {
 	}
 
 	html := buildTurnstileSandboxHTML(task.Sitekey, action, cdata)
-	return page.SetContent(html, playwright.PageSetContentOptions{
+	if err := page.SetContent(html, playwright.PageSetContentOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(20000),
-	})
+	}); err != nil {
+		return nil, err
+	}
+
+	return headers, nil
 }
 
 func setTaskFailed(task *SolveTask, message string) {
@@ -622,8 +662,79 @@ func clickTurnstileCheckbox(page playwright.Page) {
 	}
 }
 
+func collectTaskCookies(page playwright.Page, taskURL string) []TaskCookie {
+	if page == nil || page.Context() == nil {
+		return nil
+	}
+
+	rawCookies, err := page.Context().Cookies(taskURL)
+	if err != nil {
+		return nil
+	}
+
+	cookies := make([]TaskCookie, 0, len(rawCookies))
+	for _, item := range rawCookies {
+		sameSite := ""
+		if item.SameSite != nil {
+			sameSite = string(*item.SameSite)
+		}
+		cookies = append(cookies, TaskCookie{
+			Name:     item.Name,
+			Value:    item.Value,
+			Domain:   item.Domain,
+			Path:     item.Path,
+			Expires:  item.Expires,
+			HttpOnly: item.HttpOnly,
+			Secure:   item.Secure,
+			SameSite: sameSite,
+		})
+	}
+	return cookies
+}
+
+func cleanupPageAfterTask(page playwright.Page) {
+	if page != nil {
+		_, _ = page.Evaluate(`() => {
+			try {
+				localStorage.clear();
+				sessionStorage.clear();
+			} catch (_err) {}
+
+			try {
+				document.cookie.split(";").forEach((pair) => {
+					const eq = pair.indexOf("=");
+					const name = eq > -1 ? pair.substr(0, eq).trim() : pair.trim();
+					if (name) {
+						document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
+					}
+				});
+			} catch (_err) {}
+
+			return true;
+		}`)
+
+		_, _ = page.Goto("about:blank", playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+			Timeout:   playwright.Float(5000),
+		})
+	}
+
+	if page != nil && page.Context() != nil {
+		_ = page.Context().ClearCookies()
+	}
+}
+
+func releaseMemory() {
+	runtime.GC()
+	debug.FreeOSMemory()
+}
+
 func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
-	if err := loadTurnstileInTab(page, task); err != nil {
+	headers, err := loadTurnstileInTab(page, task)
+	if len(headers) > 0 {
+		task.Headers = headers
+	}
+	if err != nil {
 		setTaskFailed(task, fmt.Sprintf("overlay error: %v", err))
 		return false
 	}
@@ -655,6 +766,7 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 				task.Status = "success"
 				task.Error = nil
 				task.Token = &token
+				task.Cookies = collectTaskCookies(page, task.URL)
 				return true
 			}
 		}
@@ -670,6 +782,7 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 		time.Sleep(250 * time.Millisecond)
 	}
 
+	task.Cookies = collectTaskCookies(page, task.URL)
 	setTaskFailed(task, "timeout")
 	return false
 }
@@ -714,8 +827,11 @@ func solveTurnstileWithProxy(task *SolveTask) bool {
 	defer func() {
 		_ = page.Close()
 	}()
+	defer releaseMemory()
 
-	return solveTaskOnPage(page, task)
+	success := solveTaskOnPage(page, task)
+	cleanupPageAfterTask(page)
+	return success
 }
 
 func (w *BrowserWorker) solveTurnstile(task *SolveTask) bool {
@@ -737,10 +853,14 @@ func (w *BrowserWorker) solveTurnstile(task *SolveTask) bool {
 		return success
 	}
 
-	_, err := w.Page.Goto("about:blank", playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(5000),
-	})
+	cleanupPageAfterTask(w.Page)
+	releaseMemory()
+
+	if w.Page == nil {
+		w.TabReady = false
+		return success
+	}
+	_, err := w.Page.Title()
 	if err != nil {
 		w.TabReady = false
 		return success
@@ -1012,7 +1132,10 @@ func getTaskResultHandler(w http.ResponseWriter, r *http.Request) {
 		ErrorID: 0,
 		Status:  "ready",
 		Solution: &Solution{
-			Token: *task.Token,
+			Token:    *task.Token,
+			Headers:  task.Headers,
+			Hedeares: task.Headers,
+			Cookies:  task.Cookies,
 		},
 	})
 }
@@ -1124,7 +1247,10 @@ func resultHandler(w http.ResponseWriter, r *http.Request) {
 		"errorId": 0,
 		"status":  "ready",
 		"solution": map[string]any{
-			"token": *task.Token,
+			"token":   *task.Token,
+			"headers": task.Headers,
+			"hedears": task.Headers,
+			"cookies": task.Cookies,
 		},
 	})
 }
