@@ -485,7 +485,7 @@ func jsString(value string) string {
 	return string(b)
 }
 
-func injectCaptchaOverlay(page playwright.Page, sitekey string, action string, cdata string) error {
+func buildTurnstileSandboxHTML(sitekey string, action string, cdata string) string {
 	actionConfig := ""
 	if action != "" {
 		actionConfig = fmt.Sprintf(", action: %s", jsString(action))
@@ -496,98 +496,76 @@ func injectCaptchaOverlay(page playwright.Page, sitekey string, action string, c
 		cdataConfig = fmt.Sprintf(", cData: %s", jsString(cdata))
 	}
 
-	script := fmt.Sprintf(`
-		(() => {
-			const existingOverlay = document.querySelector('#captcha-overlay');
-			if (existingOverlay) {
-				existingOverlay.remove();
-			}
+	return fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Turnstile Solver</title>
+  <style>
+    html,body { margin:0; padding:0; width:100%%; height:100%%; background:#0b0f18; color:#fff; font-family:Arial,sans-serif; }
+    .wrap { min-height:100%%; display:flex; align-items:center; justify-content:center; }
+    .card { width:380px; padding:24px; border-radius:12px; background:#121826; border:1px solid #22314d; }
+    #widget { min-height:70px; display:flex; align-items:center; justify-content:center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div id="widget"></div>
+    </div>
+  </div>
+  <input type="hidden" id="cf-response" name="cf-turnstile-response" value="">
+  <script>
+    window.__turnstileToken = "";
+    window.__turnstileError = "";
+    window.__turnstileRendered = false;
 
-			window.__turnstileToken = null;
-			window.__turnstileWidgetId = null;
+    function setToken(token) {
+      window.__turnstileToken = token || "";
+      const input = document.getElementById("cf-response");
+      if (input) input.value = window.__turnstileToken;
+    }
 
-			const overlay = document.createElement('div');
-			overlay.id = 'captcha-overlay';
-			overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;display:flex;justify-content:center;align-items:center;z-index:999999';
+    function renderTurnstile() {
+      try {
+        if (window.__turnstileRendered) return;
+        if (!window.turnstile || typeof window.turnstile.render !== "function") return;
 
-			const captchaDiv = document.createElement('div');
-			captchaDiv.id = 'captcha-widget';
-			captchaDiv.className = 'cf-turnstile';
-			overlay.appendChild(captchaDiv);
-			document.body.appendChild(overlay);
+        window.turnstile.render("#widget", {
+          sitekey: %s%s%s,
+          callback: function(token) {
+            setToken(token);
+          },
+          "error-callback": function(code) {
+            window.__turnstileError = String(code || "unknown_error");
+          },
+          "timeout-callback": function() {
+            window.__turnstileError = "interactive_timeout";
+          }
+        });
+        window.__turnstileRendered = true;
+      } catch (err) {
+        window.__turnstileError = String(err && err.message ? err.message : err);
+      }
+    }
 
-			function setToken(token) {
-				window.__turnstileToken = token || '';
-				let input = document.querySelector('input[name="cf-turnstile-response"]');
-				if (!input) {
-					input = document.createElement('input');
-					input.type = 'hidden';
-					input.name = 'cf-turnstile-response';
-					document.body.appendChild(input);
-				}
-				input.value = window.__turnstileToken;
-			}
-
-			function renderWidget() {
-				if (!window.turnstile || typeof window.turnstile.render !== 'function') {
-					return;
-				}
-				if (window.__turnstileWidgetId !== null) {
-					return;
-				}
-
-				window.__turnstileWidgetId = window.turnstile.render('#captcha-widget', {
-					sitekey: %s%s%s,
-					callback: function(token) {
-						setToken(token);
-					}
-				});
-			}
-
-			if (!window.turnstileScriptLoaded) {
-				const script = document.createElement('script');
-				script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-				script.async = true;
-				script.onload = renderWidget;
-				document.head.appendChild(script);
-				window.turnstileScriptLoaded = true;
-			}
-
-			renderWidget();
-			setTimeout(renderWidget, 500);
-		})();
-	`, jsString(sitekey), actionConfig, cdataConfig)
-
-	_, err := page.Evaluate(script)
-	return err
+    window.onloadTurnstileCallback = function() {
+      renderTurnstile();
+    };
+  </script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
+</body>
+</html>`, jsString(sitekey), actionConfig, cdataConfig)
 }
 
-func setTaskFailed(task *SolveTask, message string) {
-	task.Status = "failed"
-	task.Error = &message
-	task.Token = nil
-}
-
-func clickTurnstileCheckbox(page playwright.Page) {
-	selectors := []string{
-		"iframe[src*='challenges.cloudflare.com']",
-		"#captcha-widget",
-		".cf-turnstile",
-	}
-
-	for _, selector := range selectors {
-		_ = page.Click(selector, playwright.PageClickOptions{Timeout: playwright.Float(750)})
-	}
-}
-
-func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
+func loadTurnstileInTab(page playwright.Page, task *SolveTask) error {
 	_, err := page.Goto(task.URL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(float64((CONFIG.TimeoutSeconds + 10) * 1000)),
 	})
 	if err != nil {
-		setTaskFailed(task, fmt.Sprintf("navigation error: %v", err))
-		return false
+		return fmt.Errorf("navigation error: %w", err)
 	}
 
 	action := ""
@@ -599,7 +577,53 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 		cdata = *task.Cdata
 	}
 
-	if err := injectCaptchaOverlay(page, task.Sitekey, action, cdata); err != nil {
+	html := buildTurnstileSandboxHTML(task.Sitekey, action, cdata)
+	return page.SetContent(html, playwright.PageSetContentOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(20000),
+	})
+}
+
+func setTaskFailed(task *SolveTask, message string) {
+	task.Status = "failed"
+	task.Error = &message
+	task.Token = nil
+}
+
+func clickTurnstileCheckbox(page playwright.Page) {
+	coordsResult, err := page.Evaluate(`() => {
+		const iframe = document.querySelector("iframe[src*='challenges.cloudflare.com']");
+		if (!iframe) return null;
+		const rect = iframe.getBoundingClientRect();
+		if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+
+		return {
+			x: rect.left + Math.min(35, rect.width / 2),
+			y: rect.top + rect.height / 2
+		};
+	}`)
+	if err == nil {
+		if coords, ok := coordsResult.(map[string]interface{}); ok {
+			xVal, xOK := coords["x"].(float64)
+			yVal, yOK := coords["y"].(float64)
+			if xOK && yOK {
+				_ = page.Mouse().Click(xVal, yVal)
+			}
+		}
+	}
+
+	selectors := []string{
+		"iframe[src*='challenges.cloudflare.com']",
+		"#widget",
+		".cf-turnstile",
+	}
+	for _, selector := range selectors {
+		_ = page.Click(selector, playwright.PageClickOptions{Timeout: playwright.Float(500)})
+	}
+}
+
+func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
+	if err := loadTurnstileInTab(page, task); err != nil {
 		setTaskFailed(task, fmt.Sprintf("overlay error: %v", err))
 		return false
 	}
@@ -632,6 +656,14 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 				task.Error = nil
 				task.Token = &token
 				return true
+			}
+		}
+
+		errorResult, errorEvalErr := page.Evaluate(`() => window.__turnstileError || ""`)
+		if errorEvalErr == nil {
+			if errorMsg, ok := errorResult.(string); ok && strings.TrimSpace(errorMsg) != "" {
+				setTaskFailed(task, "turnstile error: "+strings.TrimSpace(errorMsg))
+				return false
 			}
 		}
 
