@@ -586,10 +586,63 @@ func buildTurnstileSandboxHTML(sitekey string, action string, cdata string) stri
 </html>`, jsString(sitekey), actionConfig, cdataConfig)
 }
 
+func shouldAllowTurnstileRequest(requestURL string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(requestURL))
+	if normalized == "" {
+		return false
+	}
+
+	allowedPrefixes := []string{
+		"https://challenges.cloudflare.com/",
+		"https://challenges.fed.cloudflare.com/",
+	}
+	for _, prefix := range allowedPrefixes {
+		if strings.HasPrefix(normalized, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func loadTurnstileInTab(page playwright.Page, task *SolveTask) (map[string]string, error) {
+	_ = page.UnrouteAll()
+
+	action := ""
+	if task.Action != nil {
+		action = *task.Action
+	}
+	cdata := ""
+	if task.Cdata != nil {
+		cdata = *task.Cdata
+	}
+	html := buildTurnstileSandboxHTML(task.Sitekey, action, cdata)
+
+	if err := page.Route("**/*", func(route playwright.Route) {
+		request := route.Request()
+		requestURL := request.URL()
+
+		if shouldAllowTurnstileRequest(requestURL) {
+			_ = route.Continue()
+			return
+		}
+
+		if request.IsNavigationRequest() && request.ResourceType() == "document" {
+			_ = route.Fulfill(playwright.RouteFulfillOptions{
+				Status:      playwright.Int(200),
+				ContentType: playwright.String("text/html; charset=utf-8"),
+				Body:        html,
+			})
+			return
+		}
+
+		_ = route.Abort()
+	}); err != nil {
+		return nil, fmt.Errorf("route setup error: %w", err)
+	}
+
 	resp, err := page.Goto(task.URL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(float64((CONFIG.TimeoutSeconds + 10) * 1000)),
+		Timeout:   playwright.Float(10000),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("navigation error: %w", err)
@@ -602,23 +655,6 @@ func loadTurnstileInTab(page playwright.Page, task *SolveTask) (map[string]strin
 		} else {
 			headers = resp.Request().Headers()
 		}
-	}
-
-	action := ""
-	if task.Action != nil {
-		action = *task.Action
-	}
-	cdata := ""
-	if task.Cdata != nil {
-		cdata = *task.Cdata
-	}
-
-	html := buildTurnstileSandboxHTML(task.Sitekey, action, cdata)
-	if err := page.SetContent(html, playwright.PageSetContentOptions{
-		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(20000),
-	}); err != nil {
-		return nil, err
 	}
 
 	return headers, nil
@@ -706,6 +742,8 @@ func collectTaskCookies(page playwright.Page, taskURL string) []TaskCookie {
 
 func cleanupPageAfterTask(page playwright.Page) {
 	if page != nil {
+		_ = page.UnrouteAll()
+
 		_, _ = page.Evaluate(`() => {
 			try {
 				localStorage.clear();
@@ -752,19 +790,19 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 	}
 
 	_, _ = page.WaitForSelector("iframe[src*='challenges.cloudflare.com']", playwright.PageWaitForSelectorOptions{
-		Timeout: playwright.Float(20000),
+		Timeout: playwright.Float(8000),
 	})
 
 	deadline := time.Now().Add(time.Duration(CONFIG.TimeoutSeconds) * time.Second)
-	if CONFIG.TimeoutSeconds < 20 {
-		deadline = time.Now().Add(20 * time.Second)
+	if CONFIG.TimeoutSeconds < 12 {
+		deadline = time.Now().Add(12 * time.Second)
 	}
 	nextClickAt := time.Now()
 
 	for time.Now().Before(deadline) {
 		if time.Now().After(nextClickAt) {
 			clickTurnstileCheckbox(page)
-			nextClickAt = time.Now().Add(1500 * time.Millisecond)
+			nextClickAt = time.Now().Add(700 * time.Millisecond)
 		}
 
 		tokenResult, evalErr := page.Evaluate(`() => {
@@ -791,7 +829,7 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 			}
 		}
 
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	task.Cookies = collectTaskCookies(page, task.URL)
