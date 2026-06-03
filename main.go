@@ -35,6 +35,7 @@ type Config struct {
 	ServerPort          int
 	TaskDBPath          string
 	Headless            bool
+	AuthToken           string
 }
 
 type SolveTask struct {
@@ -104,6 +105,36 @@ type Solution struct {
 	SolveTime *float64          `json:"solveTime,omitempty"`
 }
 
+type CloudflareProxy struct {
+	Host     string `json:"host,omitempty"`
+	Port     int    `json:"port,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+type CloudflareRequest struct {
+	Mode      string           `json:"mode"`
+	Domain    string           `json:"domain,omitempty"`
+	SiteKey   string           `json:"siteKey,omitempty"`
+	Sitekey   string           `json:"sitekey,omitempty"`
+	Action    string           `json:"action,omitempty"`
+	Cdata     string           `json:"cdata,omitempty"`
+	CData     string           `json:"cData,omitempty"`
+	TTL       int64            `json:"ttl,omitempty"`
+	Expire    int64            `json:"expire,omitempty"`
+	AuthToken string           `json:"authToken,omitempty"`
+	Proxy     *CloudflareProxy `json:"proxy,omitempty"`
+	ProxyURL  string           `json:"proxyUrl,omitempty"`
+	ProxyURL2 string           `json:"proxyURL,omitempty"`
+	Task      *Task            `json:"task,omitempty"`
+}
+
+type iuamCacheEntry struct {
+	ExpireAt time.Time
+	Value    map[string]any
+}
+
 type BrowserWorker struct {
 	WorkerID   int
 	BrowserID  int
@@ -138,6 +169,13 @@ var (
 
 	browserPool []*BrowserWorker
 	pw          *playwright.Playwright
+
+	iuamCache = struct {
+		sync.RWMutex
+		Entries map[string]iuamCacheEntry
+	}{
+		Entries: map[string]iuamCacheEntry{},
+	}
 )
 
 func getenvString(key, fallback string) string {
@@ -197,6 +235,7 @@ func loadConfig() {
 		ServerPort:          getenvInt("SERVER_PORT", 5073),
 		TaskDBPath:          getenvString("TASK_DB_PATH", "tasks.json"),
 		Headless:            getenvBool("HEADLESS", false),
+		AuthToken:           getenvString("AUTH_TOKEN", ""),
 	}
 }
 
@@ -1082,6 +1121,389 @@ func extractProxyValue(task Task) *string {
 	return nil
 }
 
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func normalizeDomainURL(raw string) (string, error) {
+	domain := strings.TrimSpace(raw)
+	if domain == "" {
+		return "", fmt.Errorf("missing domain")
+	}
+	if !strings.Contains(domain, "://") {
+		domain = "https://" + domain
+	}
+
+	parsed, err := url.Parse(domain)
+	if err != nil {
+		return "", fmt.Errorf("invalid domain: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid domain URL")
+	}
+	return parsed.String(), nil
+}
+
+func cloudflareProxyURL(req CloudflareRequest) *string {
+	for _, value := range []string{req.ProxyURL2, req.ProxyURL} {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return &trimmed
+		}
+	}
+
+	if req.Task != nil {
+		if proxy := extractProxyValue(*req.Task); proxy != nil {
+			return proxy
+		}
+	}
+
+	if req.Proxy == nil {
+		return nil
+	}
+
+	if raw := strings.TrimSpace(req.Proxy.URL); raw != "" {
+		return &raw
+	}
+
+	host := strings.TrimSpace(req.Proxy.Host)
+	if host == "" {
+		return nil
+	}
+
+	port := req.Proxy.Port
+	if port <= 0 {
+		port = 80
+	}
+
+	userInfo := ""
+	username := strings.TrimSpace(req.Proxy.Username)
+	password := strings.TrimSpace(req.Proxy.Password)
+	if username != "" {
+		userInfo = url.QueryEscape(username)
+		if password != "" {
+			userInfo = userInfo + ":" + url.QueryEscape(password)
+		}
+		userInfo = userInfo + "@"
+	}
+
+	proxyURL := fmt.Sprintf("http://%s%s:%d", userInfo, host, port)
+	return &proxyURL
+}
+
+func resolveTurnstilePayload(req CloudflareRequest) (string, string, string, string, *string, error) {
+	domain := firstNonEmptyString(req.Domain)
+	sitekey := firstNonEmptyString(req.SiteKey, req.Sitekey)
+	action := firstNonEmptyString(req.Action)
+	cdata := firstNonEmptyString(req.CData, req.Cdata)
+
+	if req.Task != nil {
+		domain = firstNonEmptyString(domain, req.Task.WebsiteURL)
+		sitekey = firstNonEmptyString(sitekey, req.Task.WebsiteKey)
+		action = firstNonEmptyString(action, req.Task.Action)
+		cdata = firstNonEmptyString(cdata, req.Task.Cdata)
+	}
+
+	normalizedDomain, err := normalizeDomainURL(domain)
+	if err != nil {
+		return "", "", "", "", nil, err
+	}
+	if sitekey == "" {
+		return "", "", "", "", nil, fmt.Errorf("missing siteKey")
+	}
+
+	return normalizedDomain, sitekey, action, cdata, cloudflareProxyURL(req), nil
+}
+
+func submitTaskAndWait(task *SolveTask, timeout time.Duration) (*SolveTask, error) {
+	saveTaskToDB(task)
+
+	select {
+	case taskQueue <- task:
+		stats.Lock()
+		stats.Total++
+		stats.Unlock()
+	default:
+		return nil, fmt.Errorf("task queue is full")
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		latest := getTaskFromDB(task.TaskID)
+		if latest == nil {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+
+		if latest.Status == "success" || latest.Status == "failed" {
+			return latest, nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	timeoutMsg := "timeout waiting for solve result"
+	now := float64(time.Now().UnixNano()) / 1e9
+	task.Status = "failed"
+	task.Error = &timeoutMsg
+	task.CompletedAt = &now
+	saveTaskToDB(task)
+	return task, nil
+}
+
+func copyAnyMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func getIUAMCache(key string) (map[string]any, bool) {
+	iuamCache.RLock()
+	entry, ok := iuamCache.Entries[key]
+	iuamCache.RUnlock()
+	if !ok || time.Now().After(entry.ExpireAt) {
+		if ok {
+			iuamCache.Lock()
+			delete(iuamCache.Entries, key)
+			iuamCache.Unlock()
+		}
+		return nil, false
+	}
+	return copyAnyMap(entry.Value), true
+}
+
+func setIUAMCache(key string, value map[string]any, ttl time.Duration) {
+	iuamCache.Lock()
+	iuamCache.Entries[key] = iuamCacheEntry{
+		ExpireAt: time.Now().Add(ttl),
+		Value:    copyAnyMap(value),
+	}
+	iuamCache.Unlock()
+}
+
+func solveIUAM(domain string, proxyURL string) (map[string]any, error) {
+	browser, err := launchBrowser(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("browser launch error: %w", err)
+	}
+	defer func() { _ = browser.Close() }()
+
+	context, err := browser.NewContext(buildContextOptions())
+	if err != nil {
+		return nil, fmt.Errorf("context error: %w", err)
+	}
+	defer func() { _ = context.Close() }()
+
+	page, err := context.NewPage()
+	if err != nil {
+		return nil, fmt.Errorf("page error: %w", err)
+	}
+	defer func() { _ = page.Close() }()
+	defer releaseMemory()
+
+	start := time.Now()
+	resp, err := page.Goto(domain, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateCommit,
+		Timeout:   playwright.Float(float64((CONFIG.TimeoutSeconds + 5) * 1000)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("navigation error: %w", err)
+	}
+
+	headers := map[string]string{}
+	if resp != nil && resp.Request() != nil {
+		if allHeaders, allErr := resp.Request().AllHeaders(); allErr == nil && len(allHeaders) > 0 {
+			headers = allHeaders
+		} else {
+			headers = resp.Request().Headers()
+		}
+	}
+
+	deadline := time.Now().Add(time.Duration(CONFIG.TimeoutSeconds) * time.Second)
+	if CONFIG.TimeoutSeconds < 8 {
+		deadline = time.Now().Add(8 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		cookies := collectTaskCookies(page, domain)
+		for _, cookie := range cookies {
+			if cookie.Name == "cf_clearance" && strings.TrimSpace(cookie.Value) != "" {
+				uaValue := ""
+				if uaResult, uaErr := page.Evaluate(`() => navigator.userAgent || ""`); uaErr == nil {
+					if ua, ok := uaResult.(string); ok {
+						uaValue = ua
+					}
+				}
+
+				solveTime := time.Since(start).Seconds()
+				return map[string]any{
+					"code":         200,
+					"cf_clearance": cookie.Value,
+					"user_agent":   uaValue,
+					"headers":      headers,
+					"cookies":      cookies,
+					"solveTime":    solveTime,
+				}, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return nil, fmt.Errorf("timeout waiting for cf_clearance")
+}
+
+func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := time.Now()
+	var req CloudflareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":    400,
+			"message": "bad request: invalid JSON body",
+		})
+		return
+	}
+
+	if CONFIG.AuthToken != "" && strings.TrimSpace(req.AuthToken) != CONFIG.AuthToken {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":    401,
+			"message": "unauthorized",
+		})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	switch mode {
+	case "turnstile":
+		domain, sitekey, action, cdata, proxyURL, err := resolveTurnstilePayload(req)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    400,
+				"message": err.Error(),
+			})
+			return
+		}
+
+		task := &SolveTask{
+			TaskID:    uuid.New().String(),
+			URL:       domain,
+			Sitekey:   sitekey,
+			Proxy:     proxyURL,
+			Status:    "pending",
+			CreatedAt: float64(time.Now().UnixNano()) / 1e9,
+		}
+		if action != "" {
+			task.Action = &action
+		}
+		if cdata != "" {
+			task.Cdata = &cdata
+		}
+
+		finalTask, submitErr := submitTaskAndWait(task, time.Duration(CONFIG.TimeoutSeconds+5)*time.Second)
+		if submitErr != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    429,
+				"message": submitErr.Error(),
+			})
+			return
+		}
+
+		if finalTask == nil || finalTask.Status != "success" || finalTask.Token == nil {
+			errMessage := "failed to solve turnstile"
+			if finalTask != nil && finalTask.Error != nil {
+				errMessage = *finalTask.Error
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    500,
+				"message": errMessage,
+				"elapsed": fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+			})
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":      200,
+			"token":     *finalTask.Token,
+			"headers":   finalTask.Headers,
+			"cookies":   finalTask.Cookies,
+			"solveTime": calculateSolveTime(finalTask),
+			"elapsed":   fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+		})
+		return
+
+	case "iuam":
+		domain := firstNonEmptyString(req.Domain)
+		if req.Task != nil {
+			domain = firstNonEmptyString(domain, req.Task.WebsiteURL)
+		}
+
+		normalizedDomain, err := normalizeDomainURL(domain)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    400,
+				"message": err.Error(),
+			})
+			return
+		}
+
+		proxy := ""
+		if proxyURL := cloudflareProxyURL(req); proxyURL != nil {
+			proxy = *proxyURL
+		}
+
+		cacheKey := fmt.Sprintf("%s|%s|%s", mode, normalizedDomain, proxy)
+		if cached, ok := getIUAMCache(cacheKey); ok {
+			cached["cached"] = true
+			cached["elapsed"] = fmt.Sprintf("%.2fs", time.Since(start).Seconds())
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
+
+		result, solveErr := solveIUAM(normalizedDomain, proxy)
+		if solveErr != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    500,
+				"message": solveErr.Error(),
+				"elapsed": fmt.Sprintf("%.2fs", time.Since(start).Seconds()),
+			})
+			return
+		}
+
+		ttlMillis := req.TTL
+		if ttlMillis <= 0 {
+			ttlMillis = req.Expire
+		}
+		if ttlMillis <= 0 {
+			ttlMillis = int64((30 * time.Minute) / time.Millisecond)
+		}
+		setIUAMCache(cacheKey, result, time.Duration(ttlMillis)*time.Millisecond)
+
+		result["cached"] = false
+		result["elapsed"] = fmt.Sprintf("%.2fs", time.Since(start).Seconds())
+		_ = json.NewEncoder(w).Encode(result)
+		return
+
+	default:
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":    400,
+			"message": "invalid mode, expected turnstile or iuam",
+		})
+		return
+	}
+}
+
 func createTaskHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1368,6 +1790,7 @@ func main() {
 	startWorkers()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/cloudflare", cloudflareHandler)
 	mux.HandleFunc("/createTask", createTaskHandler)
 	mux.HandleFunc("/getTaskResult", getTaskResultHandler)
 	mux.HandleFunc("/turnstile", turnstileHandler)

@@ -30,8 +30,71 @@ All runtime variables are loaded from `.env` (with defaults when missing):
 | `SERVER_PORT` | `5073` | Bind port |
 | `TASK_DB_PATH` | `tasks.json` | JSON database path |
 | `HEADLESS` | `false` | Run Chromium headless |
+| `AUTH_TOKEN` | `` | Optional auth token for `/cloudflare` |
 
 ## API Usage
+
+### `POST /cloudflare` (cf-bypass compatible + enhanced)
+
+Supports both `turnstile` and `iuam` modes.
+
+#### Turnstile mode
+
+```bash
+curl -X POST http://localhost:5073/cloudflare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "turnstile",
+    "domain": "https://app.dataimpulse.com/sign-in",
+    "siteKey": "0x4AAAAAABkXqSagwd6aVDFz",
+    "action": "login",
+    "cData": "optional_data",
+    "proxy": {
+      "host": "127.0.0.1",
+      "port": 8080,
+      "username": "user",
+      "password": "pass"
+    }
+  }'
+```
+
+**Response**
+```json
+{
+  "code": 200,
+  "token": "0.xxxxx",
+  "headers": { "...": "..." },
+  "cookies": [],
+  "solveTime": 1.42,
+  "elapsed": "1.46s"
+}
+```
+
+#### IUAM mode
+
+```bash
+curl -X POST http://localhost:5073/cloudflare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "iuam",
+    "domain": "https://example.com",
+    "ttl": 60000
+  }'
+```
+
+**Response**
+```json
+{
+  "code": 200,
+  "cf_clearance": "...",
+  "user_agent": "Mozilla/5.0 ...",
+  "headers": { "...": "..." },
+  "cookies": [],
+  "solveTime": 2.18,
+  "cached": false,
+  "elapsed": "2.20s"
+}
+```
 
 ### `POST /createTask`
 
