@@ -641,8 +641,8 @@ func loadTurnstileInTab(page playwright.Page, task *SolveTask) (map[string]strin
 	}
 
 	resp, err := page.Goto(task.URL, playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(10000),
+		WaitUntil: playwright.WaitUntilStateCommit,
+		Timeout:   playwright.Float(6000),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("navigation error: %w", err)
@@ -696,6 +696,8 @@ func clickTurnstileCheckbox(page playwright.Page) {
 			yVal, yOK := coords["y"].(float64)
 			if xOK && yOK {
 				_ = page.Mouse().Click(xVal, yVal)
+				// Extra click helps pass to "verify you are human" quickly.
+				_ = page.Mouse().Click(xVal+2, yVal+1)
 			}
 		}
 	}
@@ -706,7 +708,7 @@ func clickTurnstileCheckbox(page playwright.Page) {
 		".cf-turnstile",
 	}
 	for _, selector := range selectors {
-		_ = page.Click(selector, playwright.PageClickOptions{Timeout: playwright.Float(500)})
+		_ = page.Click(selector, playwright.PageClickOptions{Timeout: playwright.Float(50)})
 	}
 }
 
@@ -789,47 +791,47 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 		return false
 	}
 
-	_, _ = page.WaitForSelector("iframe[src*='challenges.cloudflare.com']", playwright.PageWaitForSelectorOptions{
-		Timeout: playwright.Float(8000),
-	})
-
-	deadline := time.Now().Add(time.Duration(CONFIG.TimeoutSeconds) * time.Second)
-	if CONFIG.TimeoutSeconds < 12 {
-		deadline = time.Now().Add(12 * time.Second)
+	maxSolveSeconds := CONFIG.TimeoutSeconds
+	if maxSolveSeconds > 15 {
+		maxSolveSeconds = 15
 	}
+	if maxSolveSeconds < 8 {
+		maxSolveSeconds = 8
+	}
+	deadline := time.Now().Add(time.Duration(maxSolveSeconds) * time.Second)
 	nextClickAt := time.Now()
 
 	for time.Now().Before(deadline) {
 		if time.Now().After(nextClickAt) {
 			clickTurnstileCheckbox(page)
-			nextClickAt = time.Now().Add(700 * time.Millisecond)
+			nextClickAt = time.Now().Add(300 * time.Millisecond)
 		}
 
-		tokenResult, evalErr := page.Evaluate(`() => {
+		stateResult, evalErr := page.Evaluate(`() => {
 			const input = document.querySelector('input[name="cf-turnstile-response"]');
 			const token = window.__turnstileToken || input?.value || '';
-			return token.length > 20 ? token : null;
+			const error = window.__turnstileError || '';
+			return { token, error };
 		}`)
 
 		if evalErr == nil {
-			if token, ok := tokenResult.(string); ok && len(token) > 20 {
-				task.Status = "success"
-				task.Error = nil
-				task.Token = &token
-				task.Cookies = collectTaskCookies(page, task.URL)
-				return true
+			if state, ok := stateResult.(map[string]interface{}); ok {
+				if token, okToken := state["token"].(string); okToken && len(token) > 20 {
+					task.Status = "success"
+					task.Error = nil
+					task.Token = &token
+					task.Cookies = collectTaskCookies(page, task.URL)
+					return true
+				}
+
+				if errorMsg, okError := state["error"].(string); okError && strings.TrimSpace(errorMsg) != "" {
+					setTaskFailed(task, "turnstile error: "+strings.TrimSpace(errorMsg))
+					return false
+				}
 			}
 		}
 
-		errorResult, errorEvalErr := page.Evaluate(`() => window.__turnstileError || ""`)
-		if errorEvalErr == nil {
-			if errorMsg, ok := errorResult.(string); ok && strings.TrimSpace(errorMsg) != "" {
-				setTaskFailed(task, "turnstile error: "+strings.TrimSpace(errorMsg))
-				return false
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	task.Cookies = collectTaskCookies(page, task.URL)
