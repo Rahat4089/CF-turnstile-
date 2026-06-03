@@ -486,37 +486,77 @@ func jsString(value string) string {
 }
 
 func injectCaptchaOverlay(page playwright.Page, sitekey string, action string, cdata string) error {
-	actionScript := ""
+	actionConfig := ""
 	if action != "" {
-		actionScript = fmt.Sprintf("captchaDiv.setAttribute('data-action', %s);", jsString(action))
+		actionConfig = fmt.Sprintf(", action: %s", jsString(action))
 	}
 
-	cdataScript := ""
+	cdataConfig := ""
 	if cdata != "" {
-		cdataScript = fmt.Sprintf("captchaDiv.setAttribute('data-cdata', %s);", jsString(cdata))
+		cdataConfig = fmt.Sprintf(", cData: %s", jsString(cdata))
 	}
 
 	script := fmt.Sprintf(`
-		if (!document.querySelector('#captcha-overlay')) {
+		(() => {
+			const existingOverlay = document.querySelector('#captcha-overlay');
+			if (existingOverlay) {
+				existingOverlay.remove();
+			}
+
+			window.__turnstileToken = null;
+			window.__turnstileWidgetId = null;
+
 			const overlay = document.createElement('div');
 			overlay.id = 'captcha-overlay';
 			overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;display:flex;justify-content:center;align-items:center;z-index:999999';
+
 			const captchaDiv = document.createElement('div');
+			captchaDiv.id = 'captcha-widget';
 			captchaDiv.className = 'cf-turnstile';
-			captchaDiv.setAttribute('data-sitekey', %s);
-			%s
-			%s
 			overlay.appendChild(captchaDiv);
 			document.body.appendChild(overlay);
+
+			function setToken(token) {
+				window.__turnstileToken = token || '';
+				let input = document.querySelector('input[name="cf-turnstile-response"]');
+				if (!input) {
+					input = document.createElement('input');
+					input.type = 'hidden';
+					input.name = 'cf-turnstile-response';
+					document.body.appendChild(input);
+				}
+				input.value = window.__turnstileToken;
+			}
+
+			function renderWidget() {
+				if (!window.turnstile || typeof window.turnstile.render !== 'function') {
+					return;
+				}
+				if (window.__turnstileWidgetId !== null) {
+					return;
+				}
+
+				window.__turnstileWidgetId = window.turnstile.render('#captcha-widget', {
+					sitekey: %s%s%s,
+					callback: function(token) {
+						setToken(token);
+					}
+				});
+			}
+
 			if (!window.turnstileScriptLoaded) {
 				const script = document.createElement('script');
 				script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
 				script.async = true;
+				script.onload = renderWidget;
 				document.head.appendChild(script);
 				window.turnstileScriptLoaded = true;
 			}
-		}
-	`, jsString(sitekey), actionScript, cdataScript)
+
+			renderWidget();
+			setTimeout(renderWidget, 500);
+		})();
+	`, jsString(sitekey), actionConfig, cdataConfig)
 
 	_, err := page.Evaluate(script)
 	return err
@@ -528,10 +568,22 @@ func setTaskFailed(task *SolveTask, message string) {
 	task.Token = nil
 }
 
+func clickTurnstileCheckbox(page playwright.Page) {
+	selectors := []string{
+		"iframe[src*='challenges.cloudflare.com']",
+		"#captcha-widget",
+		".cf-turnstile",
+	}
+
+	for _, selector := range selectors {
+		_ = page.Click(selector, playwright.PageClickOptions{Timeout: playwright.Float(750)})
+	}
+}
+
 func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 	_, err := page.Goto(task.URL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(float64(CONFIG.TimeoutSeconds * 1000)),
+		Timeout:   playwright.Float(float64((CONFIG.TimeoutSeconds + 10) * 1000)),
 	})
 	if err != nil {
 		setTaskFailed(task, fmt.Sprintf("navigation error: %v", err))
@@ -552,19 +604,30 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 		return false
 	}
 
-	maxAttempts := CONFIG.TimeoutSeconds * 200
-	if maxAttempts < 200 {
-		maxAttempts = 200
-	}
+	_, _ = page.WaitForSelector("iframe[src*='challenges.cloudflare.com']", playwright.PageWaitForSelectorOptions{
+		Timeout: playwright.Float(20000),
+	})
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	deadline := time.Now().Add(time.Duration(CONFIG.TimeoutSeconds) * time.Second)
+	if CONFIG.TimeoutSeconds < 20 {
+		deadline = time.Now().Add(20 * time.Second)
+	}
+	nextClickAt := time.Now()
+
+	for time.Now().Before(deadline) {
+		if time.Now().After(nextClickAt) {
+			clickTurnstileCheckbox(page)
+			nextClickAt = time.Now().Add(1500 * time.Millisecond)
+		}
+
 		tokenResult, evalErr := page.Evaluate(`() => {
 			const input = document.querySelector('input[name="cf-turnstile-response"]');
-			return input?.value?.length > 100 ? input.value : null;
+			const token = window.__turnstileToken || input?.value || '';
+			return token.length > 20 ? token : null;
 		}`)
 
 		if evalErr == nil {
-			if token, ok := tokenResult.(string); ok && len(token) > 100 {
+			if token, ok := tokenResult.(string); ok && len(token) > 20 {
 				task.Status = "success"
 				task.Error = nil
 				task.Token = &token
@@ -572,10 +635,7 @@ func solveTaskOnPage(page playwright.Page, task *SolveTask) bool {
 			}
 		}
 
-		if attempt%40 == 10 {
-			_ = page.Click(".cf-turnstile", playwright.PageClickOptions{Timeout: playwright.Float(500)})
-		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	setTaskFailed(task, "timeout")
@@ -640,11 +700,21 @@ func (w *BrowserWorker) solveTurnstile(task *SolveTask) bool {
 		w.SolveCount++
 	}
 
-	if w.Page != nil {
-		_ = w.Page.Close()
-		w.Page = nil
+	if w.Page == nil {
+		w.TabReady = false
+		return success
 	}
-	w.TabReady = false
+
+	_, err := w.Page.Goto("about:blank", playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(5000),
+	})
+	if err != nil {
+		w.TabReady = false
+		return success
+	}
+
+	w.TabReady = true
 	return success
 }
 
@@ -709,7 +779,9 @@ func workerLoop(worker *BrowserWorker) {
 			saveTaskToDB(task)
 
 			if !useProxy {
-				worker.recreateTab()
+				if !worker.TabReady {
+					worker.recreateTab()
+				}
 				if consecutiveFailures > 10 || worker.SolveCount >= CONFIG.BrowserRecycleAfter {
 					worker.recycle()
 					consecutiveFailures = 0
