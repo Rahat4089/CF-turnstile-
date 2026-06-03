@@ -98,10 +98,10 @@ type GetTaskResultResponse struct {
 }
 
 type Solution struct {
-	Token    string            `json:"token"`
-	Headers  map[string]string `json:"headers,omitempty"`
-	Hedeares map[string]string `json:"hedears,omitempty"`
-	Cookies  []TaskCookie      `json:"cookies,omitempty"`
+	Token     string            `json:"token"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Cookies   []TaskCookie      `json:"cookies,omitempty"`
+	SolveTime *float64          `json:"solveTime,omitempty"`
 }
 
 type BrowserWorker struct {
@@ -630,6 +630,18 @@ func setTaskFailed(task *SolveTask, message string) {
 	task.Token = nil
 }
 
+func calculateSolveTime(task *SolveTask) *float64 {
+	if task == nil || task.CompletedAt == nil {
+		return nil
+	}
+
+	solveTime := *task.CompletedAt - task.CreatedAt
+	if solveTime < 0 {
+		solveTime = 0
+	}
+	return &solveTime
+}
+
 func clickTurnstileCheckbox(page playwright.Page) {
 	coordsResult, err := page.Evaluate(`() => {
 		const iframe = document.querySelector("iframe[src*='challenges.cloudflare.com']");
@@ -1132,10 +1144,10 @@ func getTaskResultHandler(w http.ResponseWriter, r *http.Request) {
 		ErrorID: 0,
 		Status:  "ready",
 		Solution: &Solution{
-			Token:    *task.Token,
-			Headers:  task.Headers,
-			Hedeares: task.Headers,
-			Cookies:  task.Cookies,
+			Token:     *task.Token,
+			Headers:   task.Headers,
+			Cookies:   task.Cookies,
+			SolveTime: calculateSolveTime(task),
 		},
 	})
 }
@@ -1247,10 +1259,10 @@ func resultHandler(w http.ResponseWriter, r *http.Request) {
 		"errorId": 0,
 		"status":  "ready",
 		"solution": map[string]any{
-			"token":   *task.Token,
-			"headers": task.Headers,
-			"hedears": task.Headers,
-			"cookies": task.Cookies,
+			"token":     *task.Token,
+			"headers":   task.Headers,
+			"cookies":   task.Cookies,
+			"solveTime": calculateSolveTime(task),
 		},
 	})
 }
