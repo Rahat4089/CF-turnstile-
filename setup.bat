@@ -12,20 +12,6 @@ if %errorlevel% neq 0 (
 
 echo ✅ Go is installed
 
-REM Install Redis if not present
-if not exist "C:\Program Files\Redis\redis-server.exe" (
-    echo 📦 Installing Redis...
-    winget install Redis.Redis
-    if %errorlevel% neq 0 (
-        echo ❌ Redis installation failed. Please install Redis manually.
-        pause
-        exit /b 1
-    )
-    echo ✅ Redis installed
-) else (
-    echo ✅ Redis already installed
-)
-
 REM Install Go dependencies
 echo 📦 Installing Go dependencies...
 go mod tidy
@@ -46,10 +32,18 @@ if %errorlevel% neq 0 (
 )
 echo ✅ Playwright browsers installed
 
-REM Start Redis server
-echo 🗄️ Starting Redis server on IPv4...
-start /B "C:\Program Files\Redis\redis-server.exe" --bind 127.0.0.1 --port 6379
-timeout /t 3 >nul
+REM Ensure .env exists
+if not exist ".env" (
+    echo ⚠️ .env not found, creating from .env.example...
+    if exist ".env.example" (
+        copy ".env.example" ".env" >nul
+        echo ✅ Created .env from .env.example
+    ) else (
+        echo ❌ Missing .env.example. Create .env manually before running.
+        pause
+        exit /b 1
+    )
+)
 
 REM Run the application
 echo 🚀 Starting CF Turnstile Solver...
@@ -57,6 +51,6 @@ echo.
 echo Server will be available at: http://localhost:5073
 echo Press Ctrl+C to stop the server
 echo.
-go run "turnstile solver.go"
+go run .
 
 pause
